@@ -1,0 +1,11 @@
+name: Trigger CI
+on: [push]
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call GitLab API
+        run: |
+          curl -X POST "${{ secrets.PORTAINER_WEBHOOK_URL }}" \
+            -H "Content-Type: application/json"

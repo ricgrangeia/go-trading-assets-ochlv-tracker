@@ -1,0 +1,18 @@
+# Ignore data directory
+data/*
+# Ignore log files
+*.log
+# Ignore compiled binaries
+*.exe
+*.out
+
+/.history
+
+# Playwright
+node_modules/
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
+/.env

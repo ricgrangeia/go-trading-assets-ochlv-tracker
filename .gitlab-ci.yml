@@ -1,0 +1,14 @@
+stages:
+  - deploy
+
+deploy-stack-main:
+  stage: deploy
+  image: curlimages/curl:latest # Use a lightweight image with curl installed
+  script:
+    - echo "Triggering Portainer webhook for stack redeployment on the main branch..."
+    - |
+      curl -X POST "${{ secrets.PORTAINER_WEBHOOK_URL }}" \
+        -H "Content-Type: application/json"
+  only:
+    - main # Trigger this job only on the live branch
+
