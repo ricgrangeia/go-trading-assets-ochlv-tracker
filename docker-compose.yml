@@ -9,7 +9,7 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: go-trades-market
+    container_name: go-asset-ochlv-tracker
     environment:
       - POSTGRES_DSN=${POSTGRES_DSN}
       - PAIRS_OVERRIDE=${PAIRS_OVERRIDE}
