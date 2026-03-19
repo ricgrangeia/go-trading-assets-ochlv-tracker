@@ -244,10 +244,17 @@ func loadPairs() []string {
 
 	var usdcPairs []ticker24h
 	for _, t := range allTickers {
+		// Ensure it ends with USDC and has some volume
 		if strings.HasSuffix(t.Symbol, "USDC") {
-			usdcPairs = append(usdcPairs, t) // ✅ FIXED
+			v, _ := strconv.ParseFloat(t.QuoteVolume, 64)
+			if v > 0 {
+				usdcPairs = append(usdcPairs, t)
+			}
 		}
 	}
+
+	// DEBUG PRINT: Check your logs for this line!
+	log.Printf("📊 Binance found %d total USDC pairs with volume > 0", len(usdcPairs))
 
 	sort.Slice(usdcPairs, func(i, j int) bool {
 		valI, _ := strconv.ParseFloat(usdcPairs[i].QuoteVolume, 64)
@@ -265,6 +272,5 @@ func loadPairs() []string {
 		top100 = append(top100, usdcPairs[i].Symbol)
 	}
 
-	log.Printf("✅ Loaded %d pairs.", len(top100))
 	return top100
 }
