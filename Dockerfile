@@ -15,7 +15,7 @@ WORKDIR /app
 COPY . .
 
 # Compile the application to a single binary called 'server'
-RUN go build -ldflags="-w -s" -o TradesMarket_app ./cmd/TradesMarket
+RUN go build -ldflags="-w -s" -o Ochlv_app ./cmd/ochlv
 
 ### STAGE 2 ###
 
@@ -40,13 +40,13 @@ RUN adduser \
 
 # Copy the compiled binary from 'build' stage
 # Binary permissions are given to our custom user to make the app runnable
-COPY --from=build --chown=${USER}:${USER} /app/TradesMarket_app ./bin/
+COPY --from=build --chown=${USER}:${USER} /app/Ochlv_app ./bin/
 # Switch to our new user
 USER ${USER}:${USER}
 
 # Define a Healthcheck
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD pgrep TradesMarket_app > /dev/null || exit 1
+    CMD pgrep Ochlv_app > /dev/null || exit 1
 
 # Launch the application
-CMD [ "./bin/TradesMarket_app" ]
+CMD [ "./bin/Ochlv_app" ]
