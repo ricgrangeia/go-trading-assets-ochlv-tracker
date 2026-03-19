@@ -169,9 +169,10 @@ func loadPairs() []string {
 		return strings.Split(strings.ToUpper(pairsOverride), ",")
 	}
 
-	log.Println("🔍 Scanning Binance for Top 50 USDC Pairs...")
+	log.Println("🌐 Fetching market data from Binance API (Go Ingestor)...")
 	resp, err := http.Get("https://api.binance.com/api/v3/ticker/24hr")
 	if err != nil {
+		log.Printf("⚠️ Binance Fetch Error: %v", err)
 		return []string{"BTCUSDC", "ETHUSDC", "SOLUSDC"}
 	}
 	defer resp.Body.Close()
@@ -181,8 +182,8 @@ func loadPairs() []string {
 
 	var usdcPairs []ticker24h
 	for _, t := range all {
-		// Strictly USDC quoted, excluding other stables like USDTUSDC
-		if strings.HasSuffix(t.Symbol, "USDC") && !strings.Contains(t.Symbol, "USDT") {
+		// EXACT MATCH for Python logic: ends with USDC
+		if strings.HasSuffix(t.Symbol, "USDC") {
 			vol, _ := strconv.ParseFloat(t.QuoteVolume, 64)
 			if vol > 0 {
 				usdcPairs = append(usdcPairs, t)
@@ -190,13 +191,15 @@ func loadPairs() []string {
 		}
 	}
 
+	// Sort by Volume Descending
 	sort.Slice(usdcPairs, func(i, j int) bool {
 		vi, _ := strconv.ParseFloat(usdcPairs[i].QuoteVolume, 64)
 		vj, _ := strconv.ParseFloat(usdcPairs[j].QuoteVolume, 64)
 		return vi > vj
 	})
 
-	limit := 50
+	// MATCH Python limit of 100
+	limit := 100
 	if len(usdcPairs) < limit {
 		limit = len(usdcPairs)
 	}
@@ -206,7 +209,7 @@ func loadPairs() []string {
 		final = append(final, usdcPairs[i].Symbol)
 	}
 
-	log.Printf("📊 Top %d USDC pairs found. Primary: %s (Volume: %s)", len(final), final[0], usdcPairs[0].QuoteVolume)
+	log.Printf("✅ Found %d USDC pairs. Market Leader: %s", len(final), final[0])
 	return final
 }
 
