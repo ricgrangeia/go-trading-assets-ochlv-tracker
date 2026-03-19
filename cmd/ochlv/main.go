@@ -19,9 +19,8 @@ import (
 var (
 	postgresDSN   = os.Getenv("POSTGRES_DSN")
 	pairsOverride = os.Getenv("PAIRS_OVERRIDE")
+	targetTable   = "ohlcv_15m" // Defined here so logs stay consistent
 )
-
-// --- Structs for WebSocket ---
 
 type KlineStreamMsg struct {
 	Symbol string `json:"s"`
@@ -32,29 +31,29 @@ type KlineStreamMsg struct {
 		Low      string  `json:"l"`
 		Close    string  `json:"c"`
 		Volume   string  `json:"v"`
-		IsClosed bool    `json:"x"` // Crucial: Only save if true
+		IsClosed bool    `json:"x"`
 	} `json:"k"`
 }
 
-// BinanceKLine matches the array response from REST API
 type BinanceKLine []interface{}
 
-// --- Logic ---
-
 func main() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	log.Println("🛠️ Starting Binance Ingestor...")
+
 	db, err := sql.Open("postgres", postgresDSN)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("❌ Database connection failed: ", err)
 	}
 	defer db.Close()
 
 	ensureOHLCVTable(db)
 	pairs := loadPairs()
 
-	// 1. Start Real-time Stream in background
+	// 1. Start Real-time Stream
 	go startRealTimeStream(db, pairs)
 
-	// 2. Run Backfill for all pairs (blocking or background)
+	// 2. Run Backfill
 	var wg sync.WaitGroup
 	for _, pair := range pairs {
 		wg.Add(1)
@@ -65,27 +64,29 @@ func main() {
 	}
 	wg.Wait()
 
-	// Keep main alive
-	log.Println("🚀 System fully operational. Backfill done, Streaming active.")
+	log.Println("🚀 BACKFILL COMPLETE. System now running in live-sync mode.")
 	select {}
 }
 
 func ensureOHLCVTable(db *sql.DB) {
-	query := `
-	CREATE TABLE IF NOT EXISTS ohlcv_15m (
-		pair TEXT NOT NULL,
-		open_time TIMESTAMPTZ NOT NULL,
-		open NUMERIC,
-		high NUMERIC,
-		low NUMERIC,
-		close NUMERIC,
-		volume NUMERIC,
-		PRIMARY KEY (pair, open_time)
-	);`
-	db.Exec(query)
+	log.Printf("📋 Verifying table [%s] exists...", targetTable)
+	query := fmt.Sprintf(`
+    CREATE TABLE IF NOT EXISTS %s (
+        pair TEXT NOT NULL,
+        open_time TIMESTAMPTZ NOT NULL,
+        open NUMERIC,
+        high NUMERIC,
+        low NUMERIC,
+        close NUMERIC,
+        volume NUMERIC,
+        PRIMARY KEY (pair, open_time)
+    );`, targetTable)
+	
+	if _, err := db.Exec(query); err != nil {
+		log.Fatal("❌ Table creation failed: ", err)
+	}
+	log.Printf("✅ Table [%s] is ready.", targetTable)
 }
-
-// --- WebSocket Real-Time Logic ---
 
 func startRealTimeStream(db *sql.DB, pairs []string) {
 	var streams []string
@@ -96,13 +97,15 @@ func startRealTimeStream(db *sql.DB, pairs []string) {
 	url := "wss://stream.binance.com:9443/ws/" + strings.Join(streams, "/")
 
 	for {
-		log.Printf("🔌 Connecting to Stream: %v", streams)
+		log.Printf("🔌 Connecting to WebSocket: %s", url)
 		conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 		if err != nil {
-			log.Printf("❌ WS Dial error: %v. Retrying...", err)
+			log.Printf("⚠️ WS Dial error: %v. Retrying in 5s...", err)
 			time.Sleep(5 * time.Second)
 			continue
 		}
+
+		log.Println("🟢 WebSocket Connected.")
 
 		for {
 			_, message, err := conn.ReadMessage()
@@ -113,52 +116,65 @@ func startRealTimeStream(db *sql.DB, pairs []string) {
 
 			var msg KlineStreamMsg
 			if err := json.Unmarshal(message, &msg); err != nil {
+				log.Printf("⚠️ JSON Parse error: %v", err)
 				continue
 			}
 
-			// ONLY save if the candle is finished
-			if msg.Data.IsClosed {
-				saveCandle(db, msg)
+			// Heartbeat log: let us know data is arriving even if candles aren't closed
+			if !msg.Data.IsClosed {
+				// We don't log every second to avoid spam, but you could add a counter here
+				continue 
 			}
+
+			log.Printf("📦 [WS] Received CLOSED candle for %s", msg.Symbol)
+			saveCandle(db, msg)
 		}
 		conn.Close()
+		log.Println("🔁 WebSocket disconnected. Reconnecting...")
 		time.Sleep(2 * time.Second)
 	}
 }
 
 func saveCandle(db *sql.DB, msg KlineStreamMsg) {
 	ts := time.UnixMilli(int64(msg.Data.OpenTime))
-	_, err := db.Exec(`
-		INSERT INTO ohlcv_15m (pair, open_time, open, high, low, close, volume)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (pair, open_time) 
-		DO UPDATE SET 
-			open = EXCLUDED.open, high = EXCLUDED.high, 
-			low = EXCLUDED.low, close = EXCLUDED.close, volume = EXCLUDED.volume
-	`, msg.Symbol, ts, msg.Data.Open, msg.Data.High, msg.Data.Low, msg.Data.Close, msg.Data.Volume)
+	
+	query := fmt.Sprintf(`
+        INSERT INTO %s (pair, open_time, open, high, low, close, volume)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (pair, open_time) 
+        DO UPDATE SET 
+            open = EXCLUDED.open, high = EXCLUDED.high, 
+            low = EXCLUDED.low, close = EXCLUDED.close, volume = EXCLUDED.volume
+    `, targetTable)
+
+	_, err := db.Exec(query, msg.Symbol, ts, msg.Data.Open, msg.Data.High, msg.Data.Low, msg.Data.Close, msg.Data.Volume)
 
 	if err != nil {
-		log.Printf("[%s] Real-time save error: %v", msg.Symbol, err)
+		log.Printf("❌ [%s] DB Save Error: %v", msg.Symbol, err)
 	} else {
-		log.Printf("📥 [%s] Saved closed candle for %v", msg.Symbol, ts)
+		log.Printf("💾 [%s] Saved to %s | TS: %s | Price: %s", msg.Symbol, targetTable, ts.Format("2006-01-02 15:04"), msg.Data.Close)
 	}
 }
-
-// --- Historical Backfill Logic (same as before, simplified) ---
 
 func backfill(db *sql.DB, pair string) {
 	targetStart := time.Now().AddDate(-1, 0, 0).UnixMilli()
 	
 	var lastTime int64
-	db.QueryRow("SELECT EXTRACT(EPOCH FROM MAX(open_time))*1000 FROM ohlcv_15m WHERE pair=$1", pair).Scan(&lastTime)
+	queryLast := fmt.Sprintf("SELECT COALESCE(EXTRACT(EPOCH FROM MAX(open_time))*1000, 0) FROM %s WHERE pair=$1", targetTable)
+	db.QueryRow(queryLast, pair).Scan(&lastTime)
+	
 	if lastTime > targetStart {
 		targetStart = lastTime + 1
 	}
 
+	log.Printf("⏳ [%s] Starting Backfill. From: %v", pair, time.UnixMilli(targetStart).Format("2006-01-02"))
+
 	for {
 		url := fmt.Sprintf("https://api.binance.com/api/v3/klines?symbol=%s&interval=15m&startTime=%d&limit=1000", pair, targetStart)
+		
 		resp, err := http.Get(url)
-		if err != nil || resp.StatusCode != 200 {
+		if err != nil {
+			log.Printf("❌ [%s] HTTP Fetch Error: %v", pair, err)
 			break
 		}
 		
@@ -166,26 +182,48 @@ func backfill(db *sql.DB, pair string) {
 		resp.Body.Close()
 
 		var klines []BinanceKLine
-		json.Unmarshal(body, &klines)
-
-		if len(klines) <= 1 { // If we only get the currently open candle, we are done
+		if err := json.Unmarshal(body, &klines); err != nil {
+			log.Printf("❌ [%s] JSON Decode Error: %v", pair, err)
 			break
 		}
 
-		// Batch insert... (Implementation omitted for brevity, use same logic as previous response)
-		
+		if len(klines) <= 1 {
+			log.Printf("🏁 [%s] Backfill finished. Reached the present.", pair)
+			break
+		}
+
+		// Insert batch
+		count := 0
+		for _, k := range klines {
+			// Small internal loop to save. For 1 year, batching this with a transaction 
+			// would be better, but for logging we show progress.
+			ts := time.UnixMilli(int64(k[0].(float64)))
+			_, err = db.Exec(fmt.Sprintf(`INSERT INTO %s (pair, open_time, open, high, low, close, volume) 
+				VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING`, targetTable),
+				pair, ts, k[1].(string), k[2].(string), k[3].(string), k[4].(string), k[5].(string))
+			if err == nil { count++ }
+		}
+
 		lastCandleTime := int64(klines[len(klines)-1][0].(float64))
 		targetStart = lastCandleTime + 1
 		
-		if len(klines) < 1000 { break }
-		time.Sleep(200 * time.Millisecond)
+		log.Printf("📑 [%s] Ingested %d candles. Current marker: %v", pair, count, time.UnixMilli(lastCandleTime).Format("2006-01-02 15:04"))
+
+		if len(klines) < 1000 { 
+			log.Printf("🏁 [%s] Backfill caught up.", pair)
+			break 
+		}
+		time.Sleep(250 * time.Millisecond) // Respect rate limits
 	}
-	log.Printf("[%s] Backfill complete.", pair)
 }
 
 func loadPairs() []string {
+	var out []string
 	if pairsOverride != "" {
-		return strings.Split(strings.ToUpper(pairsOverride), ",")
+		out = strings.Split(strings.ToUpper(pairsOverride), ",")
+	} else {
+		out = []string{"BTCUSDT", "ETHUSDT"}
 	}
-	return []string{"BTCUSDT", "ETHUSDT"}
+	log.Printf("🔍 Monitoring %d pairs: %v", len(out), out)
+	return out
 }
