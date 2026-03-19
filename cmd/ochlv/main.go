@@ -69,7 +69,7 @@ var (
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	log.Println("🛠️ Initializing Binance Perpetual Ingestor (v2.3 - 2026)")
+	log.Println("🛠️ Initializing Binance Perpetual Ingestor (v2.4 - 2026)")
 
 	if postgresDSN == "" {
 		log.Fatal("❌ POSTGRES_DSN environment variable is required")
@@ -84,7 +84,6 @@ func main() {
 
 	ensureOHLCVTable(db)
 
-	// ticker for refreshing the top 100 list and re-running backfills
 	refreshTicker := time.NewTicker(4 * time.Hour)
 	defer refreshTicker.Stop()
 
@@ -100,36 +99,42 @@ func main() {
 	}
 }
 
-// runFullCycle stops the current WS, finds new pairs, starts a new WS, and runs backfill
 func runFullCycle(db *sql.DB) {
-	// 1. Stop existing WebSocket if running
 	if wsStopChan != nil {
 		log.Println("🛑 Stopping current WebSocket to update pair list...")
 		close(wsStopChan)
 		wsWg.Wait()
 	}
 
-	// 2. Load the freshest Top 100 USDC pairs
 	pairs := loadPairs()
+	totalPairs := len(pairs)
 
-	// 3. Start new WebSocket for the new pairs
 	wsStopChan = make(chan struct{})
 	wsWg.Add(1)
 	go startRealTimeStream(db, pairs, wsStopChan, &wsWg)
 
-	// 4. Run historical backfill in parallel workers
-	log.Printf("⏳ Starting backfill for %d pairs...", len(pairs))
-	jobs := make(chan string, len(pairs))
+	log.Printf("⏳ Starting backfill for %d pairs using 10 workers...", totalPairs)
+	
+	jobs := make(chan string, totalPairs)
 	var backfillWg sync.WaitGroup
+	
+	// Atomic counter for logging progress
+	var processedCount int32
+	var mu sync.Mutex
 
 	for w := 1; w <= 10; w++ {
 		backfillWg.Add(1)
-		go func() {
+		go func(workerID int) {
 			defer backfillWg.Done()
 			for p := range jobs {
 				backfill(db, p)
+				
+				mu.Lock()
+				processedCount++
+				log.Printf("📈 Progress: [%d/%d] pairs synced (Worker %d finished %s)", processedCount, totalPairs, workerID, p)
+				mu.Unlock()
 			}
-		}()
+		}(w)
 	}
 
 	for _, p := range pairs {
@@ -137,10 +142,8 @@ func runFullCycle(db *sql.DB) {
 	}
 	close(jobs)
 	backfillWg.Wait()
-	log.Println("🚀 SYNC CYCLE COMPLETE.")
+	log.Println("🚀 ALL BACKFILLS COMPLETED. System is fully healthy.")
 }
-
-// --- Logic Modules ---
 
 func ensureOHLCVTable(db *sql.DB) {
 	query := fmt.Sprintf(`
@@ -156,17 +159,24 @@ func ensureOHLCVTable(db *sql.DB) {
     );
     CREATE INDEX IF NOT EXISTS idx_%s_pair_time ON %s (pair, open_time DESC);`,
 		targetTable, targetTable, targetTable)
-	db.Exec(query)
-	log.Printf("✅ Table [%s] ready.", targetTable)
+	
+	if _, err := db.Exec(query); err != nil {
+		log.Fatal("❌ Failed to create table:", err)
+	}
+	log.Printf("✅ Table [%s] verified and indexed.", targetTable)
 }
 
 func loadPairs() []string {
 	if pairsOverride != "" {
-		return strings.Split(strings.ToUpper(pairsOverride), ",")
+		p := strings.Split(strings.ToUpper(pairsOverride), ",")
+		log.Printf("📝 Using Override List: %v", p)
+		return p
 	}
 
+	log.Println("🔍 Fetching 24h Tickers from Binance...")
 	resp, err := http.Get("https://api.binance.com/api/v3/ticker/24hr")
 	if err != nil {
+		log.Printf("⚠️ Ticker API failed, falling back to defaults: %v", err)
 		return []string{"BTCUSDC", "ETHUSDC", "SOLUSDC"}
 	}
 	defer resp.Body.Close()
@@ -176,7 +186,6 @@ func loadPairs() []string {
 
 	var usdcPairs []ticker24h
 	for _, t := range all {
-		// Strictly filter for USDC as the quote currency
 		if strings.HasSuffix(t.Symbol, "USDC") {
 			vol, _ := strconv.ParseFloat(t.QuoteVolume, 64)
 			if vol > 0 {
@@ -185,7 +194,6 @@ func loadPairs() []string {
 		}
 	}
 
-	// Sort by 24h Volume (QuoteVolume is in USDC)
 	sort.Slice(usdcPairs, func(i, j int) bool {
 		vi, _ := strconv.ParseFloat(usdcPairs[i].QuoteVolume, 64)
 		vj, _ := strconv.ParseFloat(usdcPairs[j].QuoteVolume, 64)
@@ -202,7 +210,7 @@ func loadPairs() []string {
 		final = append(final, usdcPairs[i].Symbol)
 	}
 
-	log.Printf("📊 Top 100 USDC Pairs loaded. (Top: %s)", final[0])
+	log.Printf("📊 Sorted top %d USDC pairs. Top performer: %s (Vol: %s USDC)", len(final), final[0], usdcPairs[0].QuoteVolume)
 	return final
 }
 
@@ -218,16 +226,20 @@ func startRealTimeStream(db *sql.DB, pairs []string, stopChan chan struct{}, wg 
 	for {
 		select {
 		case <-stopChan:
+			log.Println("🔌 WebSocket manager shutting down.")
 			return
 		default:
+			log.Printf("🔌 Connecting to WebSocket (%d streams)...", len(streams))
 			conn, _, err := websocket.DefaultDialer.Dial(url, nil)
 			if err != nil {
+				log.Printf("⚠️ WS Connection failed: %v. Retrying in 5s...", err)
 				time.Sleep(5 * time.Second)
 				continue
 			}
 
-			// Inner loop for reading
+			log.Println("📡 WebSocket Connected. Listening for closed 15m candles...")
 			readErrChan := make(chan error, 1)
+			
 			go func() {
 				for {
 					_, message, err := conn.ReadMessage()
@@ -247,7 +259,8 @@ func startRealTimeStream(db *sql.DB, pairs []string, stopChan chan struct{}, wg 
 			case <-stopChan:
 				conn.Close()
 				return
-			case <-readErrChan:
+			case err := <-readErrChan:
+				log.Printf("⚠️ WebSocket Read Error: %v. Reconnecting...", err)
 				conn.Close()
 				time.Sleep(5 * time.Second)
 			}
@@ -264,7 +277,14 @@ func saveCandle(db *sql.DB, msg KlineStreamMsg) {
             open = EXCLUDED.open, high = EXCLUDED.high, 
             low = EXCLUDED.low, close = EXCLUDED.close, volume = EXCLUDED.volume
     `, targetTable)
-	db.Exec(query, msg.Symbol, ts, string(msg.Data.Open), string(msg.Data.High), string(msg.Data.Low), string(msg.Data.Close), string(msg.Data.Volume))
+	
+	_, err := db.Exec(query, msg.Symbol, ts, string(msg.Data.Open), string(msg.Data.High), string(msg.Data.Low), string(msg.Data.Close), string(msg.Data.Volume))
+	if err != nil {
+		log.Printf("❌ [%s] Database Write Error: %v", msg.Symbol, err)
+	} else {
+		// Log every live candle saved to ensure it's working
+		log.Printf("✅ [%s] Live Candle Saved: %s", msg.Symbol, ts.Format("15:04:05"))
+	}
 }
 
 func backfill(db *sql.DB, pair string) {
@@ -277,13 +297,16 @@ func backfill(db *sql.DB, pair string) {
 		startTime = lastDB + 1
 	}
 
+	totalInserted := 0
 	for {
 		url := fmt.Sprintf("https://api.binance.com/api/v3/klines?symbol=%s&interval=15m&startTime=%d&limit=1000", pair, startTime)
 		resp, err := http.Get(url)
 		if err != nil {
+			log.Printf("⚠️ [%s] HTTP Error during backfill: %v", pair, err)
 			time.Sleep(2 * time.Second)
 			continue
 		}
+		
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
@@ -293,21 +316,33 @@ func backfill(db *sql.DB, pair string) {
 		}
 
 		tx, _ := db.Begin()
+		batchCount := 0
 		for _, k := range klines {
 			ts := time.UnixMilli(int64(k[0].(float64)))
 			if ts.After(time.Now().Add(-15 * time.Minute)) {
 				continue
 			}
-			tx.Exec(fmt.Sprintf("INSERT INTO %s (pair, open_time, open, high, low, close, volume) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING", targetTable),
+			_, err := tx.Exec(fmt.Sprintf("INSERT INTO %s (pair, open_time, open, high, low, close, volume) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT DO NOTHING", targetTable),
 				pair, ts, k[1].(string), k[2].(string), k[3].(string), k[4].(string), k[5].(string))
+			if err == nil {
+				batchCount++
+			}
 		}
 		tx.Commit()
 
+		totalInserted += batchCount
 		lastMarker := int64(klines[len(klines)-1][0].(float64))
 		startTime = lastMarker + 1
+
 		if len(klines) < 1000 {
 			break
 		}
 		time.Sleep(150 * time.Millisecond)
+	}
+
+	if totalInserted > 0 {
+		log.Printf("🏁 [%s] Sync Complete: Inserted %d new candles.", pair, totalInserted)
+	} else {
+		log.Printf("🏁 [%s] Already up to date.", pair)
 	}
 }
