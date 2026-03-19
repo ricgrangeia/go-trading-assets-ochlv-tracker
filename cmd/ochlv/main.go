@@ -8,6 +8,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +54,11 @@ type KlineStreamMsg struct {
 		Volume   FlexString `json:"v"`
 		IsClosed bool       `json:"x"`
 	} `json:"k"`
+}
+
+type ticker24h struct {
+	Symbol      string `json:"symbol"`
+	QuoteVolume string `json:"quoteVolume"`
 }
 
 type BinanceKLine []interface{}
@@ -276,16 +283,54 @@ func backfill(db *sql.DB, pair string) {
 }
 
 func loadPairs() []string {
-	var out []string
+	// If the user provided a manual list, use that
 	if pairsOverride != "" {
-		raw := strings.Split(pairsOverride, ",")
-		for _, r := range raw {
-			clean := strings.ToUpper(strings.TrimSpace(r))
-			if clean != "" { out = append(out, clean) }
-		}
-	} else {
-		out = []string{"BTCUSDT", "ETHUSDT"}
+		return strings.Split(strings.ToUpper(pairsOverride), ",")
 	}
-	log.Printf("🔍 Pair selection: %v", out)
-	return out
+
+	log.Println("🔍 Fetching top 100 USDC pairs by volume from Binance...")
+
+	// 1. Get 24h ticker data for all symbols
+	resp, err := http.Get("https://api.binance.com/api/v3/ticker/24hr")
+	if err != nil {
+		log.Printf("❌ Failed to fetch tickers: %v. Falling back to BTC/ETH.", err)
+		return []string{"BTCUSDC", "ETHUSDC"}
+	}
+	defer resp.Body.Close()
+
+	var allTickers []ticker24h
+	json.NewDecoder(resp.Body).Decode(&allTickers)
+
+	// 2. Filter for USDC pairs
+	var usdcPairs []ticker24h
+	for _, t := range allTickers {
+		if strings.HasSuffix(t.Symbol, "USDC") {
+			usdcPairs = append(usdcPairs)
+		}
+	}
+
+	// 3. Sort by QuoteVolume (Descending)
+	// Note: We use string comparison or convert to float for accuracy
+	sort.Slice(usdcPairs, func(i, j int) bool {
+		valI, _ := strconv.ParseFloat(usdcPairs[i].QuoteVolume, 64)
+		valJ, _ := strconv.ParseFloat(usdcPairs[j].QuoteVolume, 64)
+		return valI > valJ
+	})
+
+	// 4. Extract top 100
+	limit := 100
+	if len(usdcPairs) < limit {
+		limit = len(usdcPairs)
+	}
+
+	var top100 []string
+	for i := 0; i < limit; i++ {
+		top100 = append(top100, usdcPairs[i].Symbol)
+	}
+
+	log.Printf("✅ Loaded %d pairs. Top 3: %v", len(top100), top100[:3])
+	return top100
 }
+
+
+
